@@ -13,20 +13,56 @@ local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 
 -- SETTINGS
 local LogoID = "rbxassetid://104477447896082"
-local DiscordLink = "https://discord.gg/TE2kKzJYEg" -- Your Discord link
+local DiscordLink = "https://discord.gg/TE2kKzJYEg"
+
 local Settings = {
     AimlockEnabled = false,
-    AimSpeed = 1.0,          -- 1.0 = INSTANT LOCK
+    AimSpeed = 1.0,
     WallCheck = true,
-    MaxDistance = 1000000000, -- ESP + AIM RADIUS = 1 BILLION studs
-    UnlockBelowHP = 10,      -- ✅ NOW UNLOCK WHEN HP ≤ 10
+    MaxDistance = 1000000000,
+    UnlockBelowHP = 13,          -- Unlock when ≤13 HP or downed
+    SwitchWhenBelowHP = 2,       -- Switch target when current ≤2 HP
     ESPEnabled = true,
     TracerEnabled = true,
-    AddedEnemies = {}
+    AddedEnemies = {},
+
+    -- Dynamic Offset Controls
+    BaseHeadHeight = 1.5,        -- Default Da Hood head height
+    SideOffsetAmount = 0.25,      -- Max left/right shift
+    Prediction = 0.12,           -- Movement prediction
+    JumpOffsetBoost = 0.15       -- Extra up when jumping
 }
 
 local ESPStorage = {}
 local EnemyListButtons = {}
+local CurrentLockedTarget = nil
+
+-- 📌 LOADING SCREEN
+local LoadingGui = Instance.new("ScreenGui")
+LoadingGui.Name = "Verity_Loading"
+LoadingGui.IgnoreGuiInset = true
+LoadingGui.Parent = PlayerGui
+
+local LoadingFrame = Instance.new("Frame")
+LoadingFrame.Size = UDim2.new(0, 320, 0, 130)
+LoadingFrame.Position = UDim2.new(0.5, -160, 0.5, -65)
+LoadingFrame.BackgroundColor3 = Color3.new(0.06,0.06,0.12)
+LoadingFrame.BorderColor3 = Color3.new(0.1, 0.6, 1)
+LoadingFrame.BorderSizePixel = 2
+LoadingFrame.Parent = LoadingGui
+Instance.new("UICorner", LoadingFrame).CornerRadius = UDim.new(0.12,0)
+
+local LoadingText = Instance.new("TextLabel")
+LoadingText.Size = UDim2.new(1,0,1,0)
+LoadingText.BackgroundTransparency = 1
+LoadingText.Text = "⚡ Loading Verity Da Hood..."
+LoadingText.Font = Enum.Font.GothamBlack
+LoadingText.TextColor3 = Color3.new(0.2, 0.7, 1)
+LoadingText.TextSize = 19
+LoadingText.Parent = LoadingFrame
+
+task.wait(1.8)
+LoadingGui:Destroy()
 
 -- NOTIFY
 local function Notify(msg)
@@ -35,15 +71,15 @@ local function Notify(msg)
     end)
 end
 
--- 📋 COPY TO CLIPBOARD FUNCTION
+-- COPY TO CLIPBOARD
 local function CopyToClipboard(text)
     pcall(function()
         setclipboard(text)
-        Notify("✅ Copied Discord link! Paste in browser/chat")
+        Notify("✅ Discord copied!")
     end)
 end
 
--- 🧠 SMART SEARCH: Find closest matching player
+-- SMART FIND PLAYER
 local function SmartFindPlayer(input)
     input = input:lower():gsub("%s", "")
     if input == "" then return nil end
@@ -53,14 +89,9 @@ local function SmartFindPlayer(input)
         if p ~= LocalPlayer then
             local name = p.Name:lower()
             local disp = p.DisplayName:lower()
-            -- Exact match first
             if name == input or disp == input then return p end
-            -- Partial match scoring
             local score = math.abs(#name - #input) + (name:find(input) and 0 or 10) + (disp:find(input) and 0 or 10)
-            if score < bestScore then
-                bestScore = score
-                bestMatch = p
-            end
+            if score < bestScore then bestScore = score; bestMatch = p end
         end
     end
     return bestMatch
@@ -69,12 +100,428 @@ end
 -- ADD / REMOVE ENEMY
 local function AddEnemy(plr)
     if not plr then return end
-    for _,e in ipairs(Settings.AddedEnemies) do
-        if e == plr then Notify("⚠️ Already added"); return end
-    end
+    for _,e in ipairs(Settings.AddedEnemies) do if e == plr then Notify("⚠️ Already added"); return end end
     table.insert(Settings.AddedEnemies, plr)
-    Notify("✅ Added: "..plr.DisplayName.." | @"..plr.Name)
+    Notify("✅ Added: "..plr.DisplayName)
     UpdateEnemyListUI()
+end
+
+local function RemoveEnemy(plr)
+    for i = #Settings.AddedEnemies, 1, -1 do
+        if Settings.AddedEnemies[i] == plr then
+            table.remove(Settings.AddedEnemies, i)
+            if ESPStorage[plr] then for _,v in pairs(ESPStorage[plr]) do v:Remove() end; ESPStorage[plr] = nil end
+            Notify("❌ Removed: "..plr.Name)
+            UpdateEnemyListUI()
+            break
+        end
+    end
+end
+
+local function AddAllEnemies()
+    local added = 0
+    for _,p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            local exists = false
+            for _,e in ipairs(Settings.AddedEnemies) do if e == p then exists = true; break end end
+            if not exists then table.insert(Settings.AddedEnemies, p); added += 1 end
+        end
+    end
+    Notify("✅ Added ALL: "..added.." players")
+    UpdateEnemyListUI()
+end
+
+-- WALL CHECK
+local function IsVisible(part)
+    if not Settings.WallCheck then return true end
+    local rayParams = RaycastParams.new()
+    rayParams.FilterDescendantsInstances = {Character, Camera}
+    rayParams.FilterType = Enum.RaycastFilterType.Exclude
+    rayParams.IgnoreWater = true
+    local rayResult = Workspace:Raycast(Camera.CFrame.Position, part.Position - Camera.CFrame.Position, rayParams)
+    return not rayResult or rayResult.Instance:IsDescendantOf(part.Parent)
+end
+
+-- 🎯 GET BEST TARGET: Closest first → switch when ≤2 HP
+local function GetBestTarget()
+    if not Settings.AimlockEnabled or #Settings.AddedEnemies == 0 then CurrentLockedTarget = nil; return nil end
+
+    local candidates = {}
+    for _, enemyPlayer in ipairs(Settings.AddedEnemies) do
+        if not enemyPlayer or not enemyPlayer.Character then continue end
+        local hum = enemyPlayer.Character:FindFirstChildOfClass("Humanoid")
+        local head = enemyPlayer.Character:FindFirstChild("Head")
+        local hrp = enemyPlayer.Character:FindFirstChild("HumanoidRootPart")
+        if not hum or not head or not hrp or hum.Health <= Settings.UnlockBelowHP or hum.Health <= 0 then continue end
+        local dist = (Camera.CFrame.Position - head.Position).Magnitude
+        if dist > Settings.MaxDistance or not IsVisible(head) then continue end
+        table.insert(candidates, {Head=head, HRP=hrp, Hum=hum, Dist=dist})
+    end
+
+    if #candidates == 0 then CurrentLockedTarget = nil; return nil end
+
+    -- Keep current unless it's low HP
+    if CurrentLockedTarget then
+        local currHum = CurrentLockedTarget.Parent:FindFirstChildOfClass("Humanoid")
+        if currHum and currHum.Health > Settings.SwitchWhenBelowHP then
+            for _,c in ipairs(candidates) do if c.Head == CurrentLockedTarget then return CurrentLockedTarget end end
+        end
+    end
+
+    -- Pick closest
+    table.sort(candidates, function(a,b) return a.Dist < b.Dist end)
+    CurrentLockedTarget = candidates[1].Head
+    return CurrentLockedTarget
+end
+
+-- ✅ DYNAMIC OFFSET: Follows movement direction + head lock always
+local function GetAimPosition(headPart)
+    if not headPart or not headPart.Parent then return nil end
+    local hrp = headPart.Parent:FindFirstChild("HumanoidRootPart")
+    local hum = headPart.Parent:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then return headPart.Position end
+
+    -- Get velocity & direction
+    local velocity = hrp.Velocity
+    local speed2D = Vector2.new(velocity.X, velocity.Z).Magnitude
+    local moveDir = Vector2.new(velocity.X, velocity.Z).Unit
+
+    -- Side offset: move left/right based on their movement direction
+    local sideOffset = 0
+    if speed2D > 1 then
+        -- Direction relative to camera view
+        local camLook = Vector2.new(Camera.CFrame.LookVector.X, Camera.CFrame.LookVector.Z).Unit
+        local cross = camLook.X * moveDir.Y - camLook.Y * moveDir.X
+        sideOffset = math.clamp(cross * Settings.SideOffsetAmount, -Settings.SideOffsetAmount, Settings.SideOffsetAmount)
+    end
+
+    -- Height offset: normal when standing, slightly higher when jumping
+    local heightOffset = Settings.BaseHeadHeight
+    if hum.FloorMaterial == Enum.Material.Air then
+        heightOffset += Settings.JumpOffsetBoost
+    end
+
+    -- Apply prediction
+    local predictedPos = headPart.Position + velocity * Settings.Prediction
+
+    -- Final aim: centered on head + dynamic side + height
+    local finalAim = predictedPos + Vector3.new(sideOffset, heightOffset, 0)
+
+    return finalAim
+end
+
+-- ESP + TRACER
+local ESPStorage = {}
+local function SetupESP(plr)
+    if ESPStorage[plr] then return end
+    ESPStorage[plr] = {
+        Tracer = Drawing.new("Line"),
+        HealthBar = Drawing.new("Square"),
+        InfoText = Drawing.new("Text")
+    }
+    local d = ESPStorage[plr]
+    d.Tracer.Thickness = 1.5
+    d.Tracer.Color = Color3.new(1,1,1)
+    d.HealthBar.Thickness = 2
+    d.HealthBar.Filled = true
+    d.InfoText.Size = 12
+    d.InfoText.Outline = true
+    d.InfoText.Color = Color3.new(1,1,1)
+end
+
+local function UpdateESP()
+    if not Settings.ESPEnabled then
+        for _,d in pairs(ESPStorage) do d.Tracer.Visible = false; d.HealthBar.Visible = false; d.InfoText.Visible = false end
+        return
+    end
+    local screenCenter = Vector2.new(Camera.ViewportSize.X/2, Camera.ViewportSize.Y/2)
+    for _,plr in ipairs(Settings.AddedEnemies) do
+        if not plr or not plr.Character then
+            if ESPStorage[plr] then ESPStorage[plr].Tracer.Visible = false; ESPStorage[plr].HealthBar.Visible = false; ESPStorage[plr].InfoText.Visible = false end
+            continue
+        end
+        local hum = plr.Character:FindFirstChildOfClass("Humanoid")
+        local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
+        local head = plr.Character:FindFirstChild("Head")
+        if not hum or not hrp or not head then continue end
+        SetupESP(plr)
+        local d = ESPStorage[plr]
+        local pos, onScreen = Camera:WorldToViewportPoint(hrp.Position)
+        if onScreen and pos.Z > 0 then
+            d.Tracer.Visible = Settings.TracerEnabled
+            d.HealthBar.Visible = true
+            d.InfoText.Visible = true
+            local headPos = Camera:WorldToViewportPoint(head.Position)
+            d.Tracer.From = screenCenter
+            d.Tracer.To = Vector2.new(headPos.X, headPos.Y)
+            d.HealthBar.Position = Vector2.new(pos.X - 22, pos.Y - 25)
+            d.HealthBar.Size = Vector2.new(3, 25 * math.clamp(hum.Health / hum.MaxHealth, 0, 1))
+            d.HealthBar.Color = hum.Health > 13 and Color3.new(0,1,0) or hum.Health > 2 and Color3.new(1,0.7,0) or Color3.new(1,0,0)
+            d.InfoText.Position = Vector2.new(pos.X, pos.Y - 35)
+            d.InfoText.Text = string.format("%s | %d HP", plr.DisplayName, math.floor(hum.Health))
+        else
+            d.Tracer.Visible = false; d.HealthBar.Visible = false; d.InfoText.Visible = false
+        end
+    end
+end
+
+-- UPDATE ENEMY LIST
+local EnemyListFrame
+function UpdateEnemyListUI()
+    for _,btn in ipairs(EnemyListButtons) do btn:Destroy() end
+    EnemyListButtons = {}
+    local yOffset = 5
+    for _,plr in ipairs(Settings.AddedEnemies) do
+        if not plr:IsA("Player") then continue end
+        local hum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
+        local hp = hum and math.floor(hum.Health).." HP" or "Offline"
+
+        local Entry = Instance.new("TextLabel")
+        Entry.Parent = EnemyListFrame
+        Entry.Size = UDim2.new(0.82, 0, 0, 28)
+        Entry.Position = UDim2.new(0.02, 0, 0, yOffset)
+        Entry.BackgroundTransparency = 0.9
+        Entry.BackgroundColor3 = Color3.new(0.2,0.2,0.2)
+        Entry.Text = plr.DisplayName.." | @"..plr.Name.." | "..hp
+        Entry.TextColor3 = hum and hum.Health > 13 and Color3.new(1,1,1) or hum and hum.Health > 2 and Color3.new(1,0.7,0) or Color3.new(1,0,0)
+        Entry.Font = Enum.Font.GothamSemibold
+        Entry.TextSize = 11
+        Entry.TextXAlignment = Enum.TextXAlignment.Left
+        table.insert(EnemyListButtons, Entry)
+
+        local RemoveBtn = Instance.new("TextButton")
+        RemoveBtn.Parent = EnemyListFrame
+        RemoveBtn.Size = UDim2.new(0.12, 0, 0, 28)
+        RemoveBtn.Position = UDim2.new(0.86, 0, 0, yOffset)
+        RemoveBtn.BackgroundColor3 = Color3.new(0.8,0.1,0.1)
+        RemoveBtn.Text = "X"
+        RemoveBtn.TextColor3 = Color3.new(1,1,1)
+        RemoveBtn.Font = Enum.Font.GothamBold
+        RemoveBtn.TextSize = 12
+        RemoveBtn.MouseButton1Click:Connect(function() RemoveEnemy(plr) end)
+        table.insert(EnemyListButtons, RemoveBtn)
+
+        yOffset = yOffset + 32
+    end
+    if #Settings.AddedEnemies == 0 then
+        local Empty = Instance.new("TextLabel")
+        Empty.Parent = EnemyListFrame
+        Empty.Size = UDim2.new(0.96,0,1,0)
+        Empty.BackgroundTransparency = 1
+        Empty.Text = "No enemies added yet"
+        Empty.TextColor3 = Color3.new(0.7,0.7,0.7)
+        Empty.Font = Enum.Font.GothamSemibold
+        Empty.TextSize = 11
+        table.insert(EnemyListButtons, Empty)
+    end
+end
+
+-- 🖥️ GUI BUILD
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "Verity_UI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.Parent = PlayerGui
+
+local MiniBtn = Instance.new("TextButton")
+MiniBtn.Size = UDim2.new(0,44,0,44)
+MiniBtn.Position = UDim2.new(0.02,0,0.1,0)
+MiniBtn.BackgroundColor3 = Color3.new(0,0,0)
+MiniBtn.BorderColor3 = Color3.new(1,1,1)
+MiniBtn.BorderSizePixel = 2
+MiniBtn.Text = "V"
+MiniBtn.Font = Enum.Font.GothamBlack
+MiniBtn.TextColor3 = Color3.new(1,1,1)
+MiniBtn.Visible = false
+Instance.new("UICorner", MiniBtn).CornerRadius = UDim.new(0.2,0)
+MiniBtn.Parent = ScreenGui
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.new(0,360,0,640)
+MainFrame.Position = UDim2.new(0.02,0,0.1,0)
+MainFrame.BackgroundColor3 = Color3.new(0,0,0)
+MainFrame.BorderColor3 = Color3.new(1,1,1)
+MainFrame.BorderSizePixel = 2
+MainFrame.Visible = true
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0.045,0)
+MainFrame.Parent = ScreenGui
+
+-- DRAG
+local dragging, dragStart, startPos = false
+MainFrame.InputBegan:Connect(function(i)
+    if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = true; dragStart = i.Position; startPos = MainFrame.Position end
+end)
+MainFrame.InputChanged:Connect(function(i)
+    if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then
+        MainFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + i.Position.X - dragStart.X, startPos.Y.Scale, startPos.Y.Offset + i.Position.Y - dragStart.Y)
+    end
+end)
+UserInputService.InputEnded:Connect(function() dragging = false end)
+
+-- TITLE BAR
+local TitleBar = Instance.new("Frame")
+TitleBar.Size = UDim2.new(1,0,0,48)
+TitleBar.BackgroundColor3 = Color3.new(0,0,0)
+TitleBar.BorderColor3 = Color3.new(1,1,1)
+Instance.new("UICorner", TitleBar).CornerRadius = UDim.new(0.045,0)
+TitleBar.Parent = MainFrame
+
+local Logo = Instance.new("ImageLabel")
+Logo.Size = UDim2.new(0,38,0,38)
+Logo.Position = UDim2.new(0,10,0,5)
+Logo.BackgroundTransparency = 1
+Logo.Image = LogoID
+Logo.Parent = TitleBar
+
+local TitleText = Instance.new("TextLabel")
+TitleText.Size = UDim2.new(1,-110,1,0)
+TitleText.Position = UDim2.new(0,55,0,0)
+TitleText.BackgroundTransparency = 1
+TitleText.Text = "Verity Da Hood"
+TitleText.Font = Enum.Font.GothamBlack
+TitleText.TextColor3 = Color3.new(1,1,1)
+TitleText.TextSize = 18
+TitleText.TextXAlignment = Enum.TextXAlignment.Left
+TitleText.Parent = TitleBar
+
+local MinBtn = Instance.new("TextButton")
+MinBtn.Size = UDim2.new(0,32,0,32)
+MinBtn.Position = UDim2.new(1,-68,0,8)
+MinBtn.BackgroundColor3 = Color3.new(0,0,0)
+MinBtn.BorderColor3 = Color3.new(1,1,1)
+MinBtn.Text = "-"
+MinBtn.Font = Enum.Font.GothamBold
+MinBtn.TextColor3 = Color3.new(1,1,1)
+Instance.new("UICorner", MinBtn).CornerRadius = UDim.new(0.25,0)
+MinBtn.Parent = TitleBar
+
+local CloseBtn = Instance.new("TextButton")
+CloseBtn.Size = UDim2.new(0,32,0,32)
+CloseBtn.Position = UDim2.new(1,-34,0,8)
+CloseBtn.BackgroundColor3 = Color3.new(0,0,0)
+CloseBtn.BorderColor3 = Color3.new(1,1,1)
+CloseBtn.Text = "X"
+CloseBtn.Font = Enum.Font.GothamBold
+MinBtn.TextColor3 = Color3.new(1,1,1)
+Instance.new("UICorner", CloseBtn).CornerRadius = UDim.new(0.25,0)
+CloseBtn.Parent = TitleBar
+
+-- ADD ENEMY BOX
+local AddBox = Instance.new("TextBox")
+AddBox.Size = UDim2.new(0.92,0,0,34)
+AddBox.Position = UDim2.new(0.04,0,0,60)
+AddBox.BackgroundColor3 = Color3.new(0.1,0.1,0.1)
+AddBox.BorderColor3 = Color3.new(1,1,1)
+AddBox.PlaceholderText = "Type name to add enemy"
+AddBox.Text = ""
+AddBox.TextColor3 = Color3.new(1,1,1)
+AddBox.Font = Enum.Font.GothamSemibold
+AddBox.TextSize = 13
+AddBox.ClearTextOnFocus = false
+Instance.new("UICorner", AddBox).CornerRadius = UDim.new(0.2,0)
+AddBox.Parent = MainFrame
+
+local AddAllBtn = Instance.new("TextButton")
+AddAllBtn.Size = UDim2.new(0.92,0,0,32)
+AddAllBtn.Position = UDim2.new(0.04,0,0,100)
+AddAllBtn.BackgroundColor3 = Color3.new(0.2,0.2,0.2)
+AddAllBtn.BorderColor3 = Color3.new(1,1,1)
+AddAllBtn.Text = "➕ ADD ALL ENEMIES"
+AddAllBtn.Font = Enum.Font.GothamSemibold
+AddAllBtn.TextColor3 = Color3.new(1,1,1)
+AddAllBtn.TextSize = 12
+Instance.new("UICorner", AddAllBtn).CornerRadius = UDim.new(0.18,0)
+AddAllBtn.Parent = MainFrame
+
+-- CONTROLS
+local SpeedLabel = Instance.new("TextLabel")
+SpeedLabel.Size = UDim2.new(0.55,0,0,28)
+SpeedLabel.Position = UDim2.new(0.04,0,0,140)
+SpeedLabel.BackgroundTransparency = 1
+SpeedLabel.Text = "LOCK SPEED: 1.00"
+SpeedLabel.Font = Enum.Font.GothamSemibold
+SpeedLabel.TextColor3 = Color3.new(1,1,1)
+SpeedLabel.TextSize = 12
+SpeedLabel.Parent = MainFrame
+
+local SpeedMinus = Instance.new("TextButton")
+SpeedMinus.Size = UDim2.new(0.15,0,0,28)
+SpeedMinus.Position = UDim2.new(0.62,0,0,140)
+SpeedMinus.BackgroundColor3 = Color3.new(0.15,0.15,0.15)
+SpeedMinus.BorderColor3 = Color3.new(1,1,1)
+SpeedMinus.Text = "-"
+SpeedMinus.Font = Enum.Font.GothamBold
+SpeedMinus.TextColor3 = Color3.new(1,1,1)
+Instance.new("UICorner", SpeedMinus).CornerRadius = UDim.new(0.2,0)
+SpeedMinus.Parent = MainFrame
+
+local SpeedPlus = Instance.new("TextButton")
+SpeedPlus.Size = UDim2.new(0.15,0,0,28)
+SpeedPlus.Position = UDim2.new(0.80,0,0,140)
+SpeedPlus.BackgroundColor3 = Color3.new(0.15,0.15,0.15)
+SpeedPlus.BorderColor3 = Color3.new(1,1,1)
+SpeedPlus.Text = "+"
+SpeedPlus.Font = Enum.Font.GothamBold
+SpeedPlus.TextColor3 = Color3.new(1,1,1)
+Instance.new("UICorner", SpeedPlus).CornerRadius = UDim.new(0.2,0)
+SpeedPlus.Parent = MainFrame
+
+local OffsetLabel = Instance.new("TextLabel")
+OffsetLabel.Size = UDim2.new(0.55,0,0,28)
+OffsetLabel.Position = UDim2.new(0.04,0,0,175)
+OffsetLabel.BackgroundTransparency = 1
+OffsetLabel.Text = "SIDE OFFSET: 0.25"
+OffsetLabel.Font = Enum.Font.GothamSemibold
+OffsetLabel.TextColor3 = Color3.new(1,1,1)
+OffsetLabel.TextSize = 12
+OffsetLabel.Parent = MainFrame
+
+local OffsetMinus = Instance.new("TextButton")
+OffsetMinus.Size = UDim2.new(0.15,0,0,28)
+OffsetMinus.Position = UDim2.new(0.62,0,0,175)
+OffsetMinus.BackgroundColor3 = Color3.new(0.15,0.15,0.15)
+OffsetMinus.BorderColor3 = Color3.new(1,1,1)
+OffsetMinus.Text = "-"
+OffsetMinus.Font = Enum.Font.GothamBold
+OffsetMinus.TextColor3 = Color3.new(1,1,1)
+Instance.new("UICorner", OffsetMinus).CornerRadius = UDim.new(0.2,0)
+OffsetMinus.Parent = MainFrame
+
+local OffsetPlus = Instance.new("TextButton")
+OffsetPlus.Size = UDim2.new(0.15,0,0,28)
+OffsetPlus.Position = UDim2.new(0.80,0,0,175)
+OffsetPlus.BackgroundColor3 = Color3.new(0.15,0.15,0.15)
+OffsetPlus.BorderColor3 = Color3.new(1,1,1)
+OffsetPlus.Text = "+"
+OffsetPlus.Font = Enum.Font.GothamBold
+OffsetPlus.TextColor3 = Color3.new(1,1,1)
+Instance.new("UICorner", OffsetPlus).CornerRadius = UDim.new(0.2,0)
+OffsetPlus.Parent = MainFrame
+
+local PredLabel = Instance.new("TextLabel")
+PredLabel.Size = UDim2.new(0.55,0,0,28)
+PredLabel.Position = UDim2.new(0.04,0,0,210)
+PredLabel.BackgroundTransparency = 1
+PredLabel.Text = "PREDICTION: 0.12"
+PredLabel.Font = Enum.Font.GothamSemibold
+PredLabel.TextColor3 = Color3.new(1,1,1)
+PredLabel.TextSize = 12
+PredLabel.Parent = MainFrame
+
+local PredMinus = Instance.new("TextButton")
+PredMinus.Size = UDim2.new(0.15,0,0,28)
+PredMinus.Position = UDim2.new(0.62,0,0,210)
+PredMinus.BackgroundColor3 = Color3.new(0.15,0.15,0.15)
+PredMinus.BorderColor3 = Color3.new(1,1,1)
+PredMinus.Text = "-"
+PredMinus.Font = Enum.Font.GothamBold
+PredMinus.TextColor3 = Color3.new(1,1,1)
+Instance.new("UICorner", PredMinus).CornerRadius = UDim.new(0.2,0)
+PredMinus.Parent = MainFrame
+
+local PredPlus = Instance.new("TextButton")
+PredPlus.Size = UDim2.new(0.15,0,0,28)
+PredPlus.Position     UpdateEnemyListUI()
 end
 
 local function RemoveEnemy(plr)
